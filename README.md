@@ -1,43 +1,49 @@
 # OpenMed Multilingual Privacy Filter Proxy
 
-Proxy OpenAI-compatible `/v1/*` qui anonymise les PII avec [`OpenMed/privacy-filter-multilingual`](https://huggingface.co/OpenMed/privacy-filter-multilingual) avant transmission à un backend LLM OpenAI-compatible.
+Minimal OpenAI-compatible `/v1/*` privacy proxy. It redacts multilingual PII with `OpenMed/privacy-filter-multilingual`, forwards the sanitized request to your OpenAI-compatible upstream, and requires a bearer token from callers.
 
-## Fonctionnement
-
-```text
-Client OpenAI-compatible
-→ api-llm-privacy-filter-multilingual
-→ redaction PII multilingue : [EMAIL_1], [FIRSTNAME_1], [DATEOFBIRTH_1], etc.
-→ upstream OpenAI-compatible
-```
-
-Le projet reprend le principe de [`ynotopec/api-llm-privacy-proxy`](https://github.com/ynotopec/api-llm-privacy-proxy), mais configure par défaut le modèle Hugging Face `OpenMed/privacy-filter-multilingual` pour une détection PII plus fine et multilingue.
-
-## Installation
+## Quick start
 
 ```bash
 ./install.sh
-cp .env.example .env
 nano .env
-./run.sh 0.0.0.0 8088
+source ./run.sh 0.0.0.0 8088
 ```
 
-## Variables importantes
+`install.sh` is idempotent and upgrade-safe: it uses `uv`, creates or reuses `~/venv/api-llm-privacy-filter-multilingual` by default, upgrades dependencies from `requirements.txt`, and creates `.env` from `.env.example` only when `.env` does not exist.
+
+`run.sh [IP] [PORT]` can be executed directly or sourced. Direct execution is suitable for systemd because it `exec`s uvicorn; sourced execution keeps compatibility with shell workflows.
+
+## Required configuration
 
 ```bash
-INBOUND_API_KEYS='change-me'
-UPSTREAM_BASE_URL='http://127.0.0.1:8000/v1'
-UPSTREAM_API_KEY=''
-PRIVACY_MODEL_ID='OpenMed/privacy-filter-multilingual'
-DEVICE=auto
-TORCH_DTYPE=auto
-TRUST_REMOTE_CODE=true
-FILTER_OUTPUT=true
-MODEL_SUFFIX='-anonym'
-MIN_ENTITY_SCORE=0.50
+cp .env.example .env
+nano .env
 ```
 
-## Appel OpenAI-compatible
+Important variables:
+
+```bash
+INBOUND_API_KEYS=change-me
+UPSTREAM_BASE_URL=http://127.0.0.1:8000/v1
+UPSTREAM_API_KEY=
+PRIVACY_MODEL_ID=OpenMed/privacy-filter-multilingual
+```
+
+Optional/default variables are commented in `.env.example`.
+
+## API
+
+The proxy is OpenAI-compatible and forwards popular `/v1/*` APIs, including:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /v1/completions`
+- `POST /v1/embeddings`
+- any other OpenAI-compatible `/v1/{path}` endpoint supported by your upstream
+
+Authentication uses bearer tokens from `INBOUND_API_KEYS`:
 
 ```bash
 curl -s http://127.0.0.1:8088/v1/chat/completions \
@@ -46,40 +52,54 @@ curl -s http://127.0.0.1:8088/v1/chat/completions \
   -d '{
     "model": "gpt-4o-anonym",
     "messages": [
-      {
-        "role": "user",
-        "content": "Bonjour, je suis Alice Martin, née le 03/15/1985, email alice@example.com"
-      }
+      {"role": "user", "content": "Bonjour, je suis Alice Martin, email alice@example.com"}
     ]
   }' | jq .
 ```
 
-Le suffixe `MODEL_SUFFIX` est uniquement exposé au client. Le proxy retire `-anonym` avant d'appeler l'upstream, puis le rajoute dans les réponses JSON et `/v1/models`.
+`MODEL_SUFFIX` is exposed to clients only. By default the client asks for `gpt-4o-anonym`; the proxy sends `gpt-4o` upstream and adds `-anonym` back in JSON responses and `/v1/models`.
 
-## Endpoints
+## GPU notes: H100 and DGX Spark
 
-- `GET /health` : état du proxy et configuration principale.
-- `GET /metrics` : métriques Prometheus, protégées par `INBOUND_API_KEYS` si `METRICS_REQUIRE_AUTH=true`.
-- `/v1/{path}` : proxy générique OpenAI-compatible.
+Defaults are hardware-compatible:
 
-## Développement et tests
+- `DEVICE=auto` lets Transformers/Accelerate choose CUDA devices when available.
+- `TORCH_DTYPE=auto` keeps dtype selection conservative across CPU, H100, and DGX Spark style CUDA environments.
+- For H100, you may set `TORCH_DTYPE=bf16` after validating your local PyTorch/CUDA stack.
+- For constrained GPU memory, keep `MODEL_IDLE_UNLOAD_SECONDS=300` or lower it so idle model weights are released.
+
+Install the PyTorch build recommended for your NVIDIA driver/CUDA image before or after `./install.sh` if your base image does not already provide a suitable GPU-enabled `torch` wheel.
+
+## Health, metrics, and tests
 
 ```bash
+curl -s http://127.0.0.1:8088/health | jq .
+curl -s -H 'Authorization: Bearer change-me' http://127.0.0.1:8088/metrics
 python -m py_compile app.py fake_upstream.py
 pytest -q
 ```
 
-Pour tester sans vrai serveur LLM :
+For local upstream testing:
 
 ```bash
 uvicorn fake_upstream:app --host 127.0.0.1 --port 8000
-./run.sh 127.0.0.1 8088
+source ./run.sh 127.0.0.1 8088
 ```
 
-## Notes production
+## systemd example
 
-- Par défaut, le proxy filtre les entrées envoyées au LLM et les réponses du LLM (`FILTER_OUTPUT=true`).
-- `OpenMed/privacy-filter-multilingual` expose 54 catégories PII et couvre 16 langues, mais un seuil et des règles métier doivent être validés sur vos données.
-- `TRUST_REMOTE_CODE=true` est activé par défaut pour charger correctement le modèle OpenMed via Transformers.
-- Le streaming est transmis tel quel : l'entrée est filtrée avant l'appel upstream, mais les chunks de sortie streamés ne sont pas réécrits.
-- Pour contexte gouvernemental, médical, RH ou financier, valider sur corpus interne et ajouter des règles déterministes si nécessaire.
+```ini
+[Unit]
+Description=OpenMed Privacy Filter Proxy
+After=network-online.target
+
+[Service]
+WorkingDirectory=/workspace/api-llm-privacy-filter-multilingual
+Environment=VENV_DIR=/root/venv/api-llm-privacy-filter-multilingual
+ExecStart=/workspace/api-llm-privacy-filter-multilingual/run.sh 0.0.0.0 8088
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
