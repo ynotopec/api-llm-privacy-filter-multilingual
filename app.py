@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.background import BackgroundTask
-from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
 load_dotenv()
 
@@ -212,7 +211,9 @@ class PrivacySanitizer:
         async with self._load_lock:
             if self.classifier is not None:
                 return
-            log.info("Loading privacy model: %s", settings.privacy_model_id)
+            log.info("Loading OpenMed privacy model: %s", settings.privacy_model_id)
+            from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
+
             model_kwargs: Dict[str, Any] = {"trust_remote_code": settings.trust_remote_code}
             if settings.torch_dtype == "bf16":
                 model_kwargs["torch_dtype"] = torch.bfloat16
@@ -236,33 +237,57 @@ class PrivacySanitizer:
         except Exception:
             return max(1, len(text.split()))
 
+    def _extract_entities(self, text: str) -> List[Dict[str, Any]]:
+        if self.classifier is None:
+            return []
+        return self.classifier(text)
+
+    @staticmethod
+    def _entity_score(entity: Dict[str, Any]) -> float:
+        return float(entity.get("score", entity.get("confidence", entity.get("probability", 1.0))))
+
+    @staticmethod
+    def _entity_label(entity: Dict[str, Any]) -> str:
+        return normalize_label(str(entity.get("entity_group") or entity.get("entity") or entity.get("label") or "private"))
+
+    @staticmethod
+    def _entity_span(text: str, entity: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+        start = entity.get("start")
+        end = entity.get("end")
+        if start is None or end is None:
+            value = entity.get("word") or entity.get("text") or entity.get("span")
+            idx = text.find(value) if isinstance(value, str) and value else -1
+            if idx >= 0:
+                start, end = idx, idx + len(value)
+        if start is None or end is None:
+            return None
+        start, end = int(start), int(end)
+        if 0 <= start < end <= len(text):
+            return start, end
+        return None
+
     async def sanitize_text(self, text: str, ctx: RedactionContext, stats: RedactionStats) -> str:
         if not text or len(text) > settings.max_string_chars:
             return text
         await self.ensure_loaded()
         self._touch()
         try:
-            entities = self.classifier(text)
+            entities = self._extract_entities(text)
         except Exception as exc:
             log.exception("Privacy model inference failed")
             raise HTTPException(status_code=500, detail=f"privacy_filter_failed: {exc}") from exc
         spans = []
         for entity in entities:
-            score = float(entity.get("score", 0.0))
+            score = self._entity_score(entity)
             if score < settings.min_entity_score:
                 continue
-            start = entity.get("start")
-            end = entity.get("end")
-            if start is None or end is None:
-                word = entity.get("word", "")
-                idx = text.find(word) if word else -1
-                if idx >= 0:
-                    start, end = idx, idx + len(word)
-            if start is None or end is None:
+            span = self._entity_span(text, entity)
+            if span is None:
                 continue
-            start, end = int(start), int(end)
-            if 0 <= start < end <= len(text):
-                spans.append((start, end, normalize_label(entity.get("entity_group") or entity.get("entity") or "private"), score))
+            spans.append((span[0], span[1], self._entity_label(entity), score))
+        return self._replace_spans(text, spans, ctx, stats)
+
+    def _replace_spans(self, text: str, spans: List[Tuple[int, int, str, float]], ctx: RedactionContext, stats: RedactionStats) -> str:
         if not spans:
             return text
         spans.sort(key=lambda item: (item[0], -(item[1] - item[0])))

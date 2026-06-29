@@ -36,8 +36,9 @@ async def test_sanitize_payload_redacts_stable_placeholders(monkeypatch):
     def fake_classifier(text):
         entities = []
         start = text.find("Alice")
-        if start >= 0:
+        while start >= 0:
             entities.append({"start": start, "end": start + 5, "entity_group": "FIRSTNAME", "score": 0.99})
+            start = text.find("Alice", start + 1)
         email = "alice@example.com"
         start = text.find(email)
         if start >= 0:
