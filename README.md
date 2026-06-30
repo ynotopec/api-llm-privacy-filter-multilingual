@@ -1,6 +1,6 @@
 # OpenMed Multilingual Privacy Filter Proxy
 
-Minimal OpenAI-compatible `/v1/*` privacy proxy. It redacts multilingual PII with `OpenMed/privacy-filter-multilingual`, forwards the sanitized request to your OpenAI-compatible upstream, and requires a bearer token from callers.
+Minimal OpenAI-compatible `/v1/*` privacy proxy. It redacts multilingual PII with `OpenMed/privacy-filter-multilingual` and requires a bearer token from callers. An OpenAI-compatible LLM upstream is optional: configure one to proxy completions, or leave it empty to run the service as a privacy-only redaction API.
 
 ## Quick start
 
@@ -25,16 +25,16 @@ Important variables:
 
 ```bash
 INBOUND_API_KEYS=change-me
-UPSTREAM_BASE_URL=http://127.0.0.1:8000/v1
+UPSTREAM_BASE_URL=
 UPSTREAM_API_KEY=
 PRIVACY_MODEL_ID=OpenMed/privacy-filter-multilingual
 ```
 
-Optional/default variables are commented in `.env.example`.
+`UPSTREAM_BASE_URL` and `UPSTREAM_API_KEY` are optional. Leave `UPSTREAM_BASE_URL` empty for privacy-only mode, or set it to an OpenAI-compatible `/v1` endpoint to forward sanitized requests to an LLM. Optional/default variables are commented in `.env.example`.
 
 ## API
 
-The proxy is OpenAI-compatible and forwards popular `/v1/*` APIs, including:
+When `UPSTREAM_BASE_URL` is configured, the proxy is OpenAI-compatible and forwards popular `/v1/*` APIs, including:
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
@@ -57,7 +57,16 @@ curl -s http://127.0.0.1:8088/v1/chat/completions \
   }' | jq .
 ```
 
-`MODEL_SUFFIX` is exposed to clients only. By default the client asks for `gpt-4o-anonym`; the proxy sends `gpt-4o` upstream and adds `-anonym` back in JSON responses and `/v1/models`.
+In privacy-only mode, POST requests to `/sanitize`, `/redact`, or `/v1/*` return the sanitized payload plus redaction counts without calling an LLM.
+
+```bash
+curl -s http://127.0.0.1:8088/sanitize \
+  -H 'Authorization: Bearer change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Bonjour, je suis Alice Martin, email alice@example.com"}' | jq .
+```
+
+`MODEL_SUFFIX` is exposed to clients only when LLM proxying is enabled. By default the client asks for `gpt-4o-anonym`; the proxy sends `gpt-4o` upstream and adds `-anonym` back in JSON responses and `/v1/models`.
 
 ## GPU notes: H100 and DGX Spark
 

@@ -28,7 +28,7 @@ class Settings:
     inbound_api_keys: List[str] = field(
         default_factory=lambda: [x.strip() for x in os.getenv("INBOUND_API_KEYS", "").split(",") if x.strip()]
     )
-    upstream_base_url: str = os.getenv("UPSTREAM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
+    upstream_base_url: str = os.getenv("UPSTREAM_BASE_URL", "").rstrip("/")
     upstream_api_key: str = os.getenv("UPSTREAM_API_KEY", "")
     privacy_model_id: str = os.getenv("PRIVACY_MODEL_ID", "OpenMed/privacy-filter-multilingual")
     device: str = os.getenv("DEVICE", "auto")
@@ -50,6 +50,10 @@ class Settings:
         }
     )
     metrics_require_auth: bool = os.getenv("METRICS_REQUIRE_AUTH", "true").lower() in ("1", "true", "yes", "on")
+
+    @property
+    def llm_enabled(self) -> bool:
+        return bool(self.upstream_base_url)
 
 
 settings = Settings()
@@ -343,7 +347,13 @@ def require_auth(req: Request, *, metrics_auth: bool = False) -> None:
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    return {"status": "ok", "model": settings.privacy_model_id, "upstream": settings.upstream_base_url, "filter_output": settings.filter_output}
+    return {
+        "status": "ok",
+        "model": settings.privacy_model_id,
+        "llm_enabled": settings.llm_enabled,
+        "upstream": settings.upstream_base_url or None,
+        "filter_output": settings.filter_output,
+    }
 
 
 @app.get("/metrics")
@@ -381,6 +391,8 @@ def add_response_model_suffixes(upstream_resp: Response, full_path: str) -> Resp
 
 
 async def forward_request(req: Request, full_path: str, sanitized_payload: Any, stream: bool = False) -> Response:
+    if not settings.llm_enabled:
+        raise HTTPException(status_code=503, detail="llm_upstream_disabled")
     url = f"{settings.upstream_base_url}/{unsuffix_model_path(full_path)}"
     timeout = httpx.Timeout(600.0, connect=30.0)
     if stream:
@@ -400,12 +412,48 @@ async def forward_request(req: Request, full_path: str, sanitized_payload: Any, 
     return Response(content=upstream.content, status_code=upstream.status_code, headers=headers, media_type=upstream.headers.get("content-type", "application/json"))
 
 
+def privacy_only_response(sanitized_payload: Any, stats: RedactionStats, latency_ms: float) -> JSONResponse:
+    response = JSONResponse(
+        content={
+            "object": "privacy.redaction",
+            "llm_enabled": False,
+            "data": sanitized_payload,
+            "privacy": {
+                "filtered_tokens": stats.tokens,
+                "filtered_spans": stats.spans,
+                "filtered_by_label": stats.labels,
+            },
+        },
+        status_code=200,
+    )
+    response.headers["x-privacy-filtered-tokens"] = str(stats.tokens)
+    response.headers["x-privacy-filtered-spans"] = str(stats.spans)
+    response.headers["x-privacy-filter-latency-ms"] = str(round(latency_ms, 2))
+    return response
+
+
+@app.post("/redact")
+@app.post("/sanitize")
+async def redact_payload(req: Request) -> JSONResponse:
+    require_auth(req)
+    try:
+        payload = await req.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="expected_json_body") from exc
+    started_at = time.perf_counter()
+    sanitized_payload, stats = await sanitizer.sanitize_payload(payload)
+    await metrics.add(stats.tokens, stats.spans, stats.labels)
+    return privacy_only_response(sanitized_payload, stats, (time.perf_counter() - started_at) * 1000)
+
+
 @app.api_route("/v1/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy_openai(req: Request, full_path: str) -> Response:
     if req.method == "OPTIONS":
         return Response(status_code=204)
     require_auth(req)
     if req.method in ("GET", "DELETE"):
+        if not settings.llm_enabled:
+            raise HTTPException(status_code=503, detail="llm_upstream_disabled")
         return add_response_model_suffixes(await forward_request(req, full_path, None), full_path)
     try:
         payload = await req.json()
@@ -415,6 +463,8 @@ async def proxy_openai(req: Request, full_path: str) -> Response:
     sanitized_payload, in_stats = await sanitizer.sanitize_payload(payload)
     sanitized_payload = rewrite_request_model_ids(sanitized_payload)
     await metrics.add(in_stats.tokens, in_stats.spans, in_stats.labels)
+    if not settings.llm_enabled:
+        return privacy_only_response(sanitized_payload, in_stats, (time.perf_counter() - started_at) * 1000)
     if isinstance(payload, dict) and payload.get("stream") is True:
         return await forward_request(req, full_path, sanitized_payload, stream=True)
     upstream_resp = await forward_request(req, full_path, sanitized_payload)
