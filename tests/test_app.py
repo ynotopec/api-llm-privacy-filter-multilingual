@@ -10,6 +10,7 @@ import app
 def reset_state(monkeypatch):
     monkeypatch.setattr(app.settings, "inbound_api_keys", ["test-key"])
     monkeypatch.setattr(app.settings, "upstream_api_key", "")
+    monkeypatch.setattr(app.settings, "upstream_base_url", "http://127.0.0.1:8000/v1")
     monkeypatch.setattr(app.settings, "model_suffix", "-anonym")
     monkeypatch.setattr(app.settings, "filter_output", True)
     app.metrics.requests_total = 0
@@ -93,4 +94,41 @@ async def test_proxy_sanitizes_and_rewrites_models(monkeypatch):
     response = await app.proxy_openai(Request(scope, receive), "chat/completions")
     assert response.status_code == 200
     assert json.loads(response.body)["model"] == "demo-model-anonym"
+    assert response.headers["x-privacy-filtered-spans"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_privacy_only_mode_returns_sanitized_payload(monkeypatch):
+    monkeypatch.setattr(app.settings, "upstream_base_url", "")
+
+    async def fake_sanitize_payload(payload):
+        payload = json.loads(json.dumps(payload))
+        payload["messages"][0]["content"] = "Bonjour [FIRSTNAME_1]"
+        return payload, app.RedactionStats(tokens=1, spans=1, labels={"firstname": 1})
+
+    monkeypatch.setattr(app.sanitizer, "sanitize_payload", fake_sanitize_payload)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [(b"authorization", b"Bearer test-key"), (b"content-type", b"application/json")],
+        "query_string": b"",
+        "server": ("testserver", 80),
+        "client": ("testclient", 50000),
+        "scheme": "http",
+    }
+    body = json.dumps({"model": "demo-model-anonym", "messages": [{"role": "user", "content": "Bonjour Alice"}]}).encode()
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    response = await app.proxy_openai(Request(scope, receive), "chat/completions")
+    payload = json.loads(response.body)
+    assert response.status_code == 200
+    assert payload["object"] == "chat.completion"
+    assert payload["llm_enabled"] is False
+    assert payload["model"] == "demo-model-anonym"
+    assert payload["choices"][0]["message"]["content"] == "Bonjour [FIRSTNAME_1]"
+    assert payload["privacy"]["filtered_spans"] == 1
     assert response.headers["x-privacy-filtered-spans"] == "1"
