@@ -126,8 +126,9 @@ async def test_privacy_only_mode_returns_sanitized_payload(monkeypatch):
     response = await app.proxy_openai(Request(scope, receive), "chat/completions")
     payload = json.loads(response.body)
     assert response.status_code == 200
+    assert payload["object"] == "chat.completion"
     assert payload["llm_enabled"] is False
-    assert payload["data"]["model"] == "demo-model"
-    assert payload["data"]["messages"][0]["content"] == "Bonjour [FIRSTNAME_1]"
+    assert payload["model"] == "demo-model-anonym"
+    assert payload["choices"][0]["message"]["content"] == "Bonjour [FIRSTNAME_1]"
     assert payload["privacy"]["filtered_spans"] == 1
     assert response.headers["x-privacy-filtered-spans"] == "1"

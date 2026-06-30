@@ -57,7 +57,7 @@ curl -s http://127.0.0.1:8088/v1/chat/completions \
   }' | jq .
 ```
 
-In privacy-only mode, POST requests to `/sanitize`, `/redact`, or `/v1/*` return the sanitized payload plus redaction counts without calling an LLM.
+In privacy-only mode, POST requests to `/sanitize` or `/redact` return the sanitized payload plus redaction counts without calling an LLM. OpenAI-compatible endpoints such as `/v1/chat/completions`, `/v1/completions`, and `/v1/responses` keep an OpenAI-compatible response shape and put the sanitized text in the normal output field, for example `choices[0].message.content` for chat completions.
 
 ```bash
 curl -s http://127.0.0.1:8088/sanitize \

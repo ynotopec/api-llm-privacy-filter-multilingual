@@ -412,24 +412,100 @@ async def forward_request(req: Request, full_path: str, sanitized_payload: Any, 
     return Response(content=upstream.content, status_code=upstream.status_code, headers=headers, media_type=upstream.headers.get("content-type", "application/json"))
 
 
+def attach_privacy_headers(response: JSONResponse, stats: RedactionStats, latency_ms: float) -> JSONResponse:
+    response.headers["x-privacy-filtered-tokens"] = str(stats.tokens)
+    response.headers["x-privacy-filtered-spans"] = str(stats.spans)
+    response.headers["x-privacy-filter-latency-ms"] = str(round(latency_ms, 2))
+    return response
+
+
+def privacy_metadata(stats: RedactionStats) -> Dict[str, Any]:
+    return {
+        "filtered_tokens": stats.tokens,
+        "filtered_spans": stats.spans,
+        "filtered_by_label": stats.labels,
+    }
+
+
+def extract_sanitized_text(payload: Any) -> str:
+    if isinstance(payload, dict):
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if isinstance(message, dict) and isinstance(message.get("content"), str):
+                    return message["content"]
+        for key in ("input", "prompt", "content", "text"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                return value
+    if isinstance(payload, str):
+        return payload
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def privacy_only_response(sanitized_payload: Any, stats: RedactionStats, latency_ms: float) -> JSONResponse:
     response = JSONResponse(
         content={
             "object": "privacy.redaction",
             "llm_enabled": False,
             "data": sanitized_payload,
-            "privacy": {
-                "filtered_tokens": stats.tokens,
-                "filtered_spans": stats.spans,
-                "filtered_by_label": stats.labels,
-            },
+            "privacy": privacy_metadata(stats),
         },
         status_code=200,
     )
-    response.headers["x-privacy-filtered-tokens"] = str(stats.tokens)
-    response.headers["x-privacy-filtered-spans"] = str(stats.spans)
-    response.headers["x-privacy-filter-latency-ms"] = str(round(latency_ms, 2))
-    return response
+    return attach_privacy_headers(response, stats, latency_ms)
+
+
+def openai_privacy_only_response(full_path: str, sanitized_payload: Any, stats: RedactionStats, latency_ms: float) -> JSONResponse:
+    created = int(time.time())
+    model = "privacy-redaction"
+    if isinstance(sanitized_payload, dict) and isinstance(sanitized_payload.get("model"), str):
+        model = suffix_model_id(sanitized_payload["model"])
+    content = extract_sanitized_text(sanitized_payload)
+    metadata = {"llm_enabled": False, "privacy": privacy_metadata(stats)}
+    if full_path == "chat/completions":
+        payload = {
+            "id": f"chatcmpl-privacy-{created}",
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            **metadata,
+        }
+    elif full_path == "completions":
+        payload = {
+            "id": f"cmpl-privacy-{created}",
+            "object": "text_completion",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "text": content, "finish_reason": "stop"}],
+            **metadata,
+        }
+    elif full_path == "responses":
+        payload = {
+            "id": f"resp-privacy-{created}",
+            "object": "response",
+            "created_at": created,
+            "model": model,
+            "output_text": content,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": content}],
+                }
+            ],
+            **metadata,
+        }
+    else:
+        return privacy_only_response(sanitized_payload, stats, latency_ms)
+    return attach_privacy_headers(JSONResponse(content=payload, status_code=200), stats, latency_ms)
 
 
 @app.post("/redact")
@@ -464,7 +540,7 @@ async def proxy_openai(req: Request, full_path: str) -> Response:
     sanitized_payload = rewrite_request_model_ids(sanitized_payload)
     await metrics.add(in_stats.tokens, in_stats.spans, in_stats.labels)
     if not settings.llm_enabled:
-        return privacy_only_response(sanitized_payload, in_stats, (time.perf_counter() - started_at) * 1000)
+        return openai_privacy_only_response(full_path, sanitized_payload, in_stats, (time.perf_counter() - started_at) * 1000)
     if isinstance(payload, dict) and payload.get("stream") is True:
         return await forward_request(req, full_path, sanitized_payload, stream=True)
     upstream_resp = await forward_request(req, full_path, sanitized_payload)
